@@ -19,6 +19,32 @@ pub struct CoreInfo {
     allow_frontend_to_extract_archives: bool
 }
 
+struct Variable {
+    pub key: CString,
+    pub value: CString
+}
+
+pub struct Variables {
+    variables: Vec<Variable>,
+}
+
+impl Variables {
+    pub fn new() -> Variables {
+        Variables {
+            variables: vec![]
+        }
+    }
+
+    pub fn variable( mut self, key: &str, options: &[&str], description: &str ) -> Self {
+        let value = description.to_string() + "; " + &options.join( "|" );
+        self.variables.push( Variable {
+            key: CString::new( key ).unwrap(),
+            value: CString::new( value ).unwrap()
+        } );
+        self
+    }
+}
+
 impl CoreInfo {
     pub fn new( name: &str, version: &str ) -> CoreInfo {
         CoreInfo {
@@ -185,6 +211,9 @@ pub enum JoypadButton {
 
 pub trait Core: Default {
     fn info() -> CoreInfo;
+    fn variables() -> Variables {
+        Variables::new()
+    }
     fn on_load_game( &mut self, game_data: GameData ) -> LoadGameResult;
     fn on_unload_game( &mut self ) -> GameData;
     fn on_run( &mut self, handle: &mut RuntimeHandle );
@@ -282,6 +311,33 @@ impl< B: Core > Retro< B > {
 
     pub fn on_set_environment( callback: libretro_sys::EnvironmentFn ) {
         set_callback!( ENVIRONMENT_CALLBACK, callback );
+
+        // Pointers in EnvironmentFn have to be statically allocated
+        static mut VARIABLES: Option< *const Vec< Variable > > = None;
+        let owned = unsafe {
+            if VARIABLES.is_none() {
+                VARIABLES = Some( Box::into_raw( Box::new( B::variables().variables ) ) );
+            }
+            VARIABLES.map( |owned| &*owned ).unwrap()
+        };
+
+        let mut variables: Vec< libretro_sys::Variable > = owned.iter()
+            .map( |v| libretro_sys::Variable {
+                key: v.key.as_ptr(),
+                value: v.value.as_ptr()
+            } ).collect();
+
+        // The variables array is terminated by a { NULL, NULL } entry
+        variables.push( libretro_sys::Variable {
+            key: ptr::null_mut(),
+            value: ptr::null_mut()
+        } );
+
+        unsafe {
+            (callback)(
+                libretro_sys::ENVIRONMENT_SET_VARIABLES,
+                variables.as_mut_ptr() as *mut libc::c_void );
+        }
     }
 
     pub fn on_set_video_refresh( &mut self, callback: libretro_sys::VideoRefreshFn ) {
@@ -389,6 +445,7 @@ impl< B: Core > Retro< B > {
             video_refresh_callback: self.video_refresh_callback.unwrap(),
             input_state_callback: self.input_state_callback.unwrap(),
             audio_sample_batch_callback: self.audio_sample_batch_callback.unwrap(),
+            environment_callback: unsafe { ENVIRONMENT_CALLBACK.unwrap() },
             upload_video_frame_already_called: false,
             audio_samples_uploaded: 0,
 
@@ -473,6 +530,7 @@ pub struct RuntimeHandle {
     video_refresh_callback: libretro_sys::VideoRefreshFn,
     input_state_callback: libretro_sys::InputStateFn,
     audio_sample_batch_callback: libretro_sys::AudioSampleBatchFn,
+    environment_callback: libretro_sys::EnvironmentFn,
     upload_video_frame_already_called: bool,
     audio_samples_uploaded: usize,
 
@@ -501,6 +559,41 @@ impl RuntimeHandle {
         self.audio_samples_uploaded += data.len();
         unsafe {
             (self.audio_sample_batch_callback)( data.as_ptr(), data.len() / 2 );
+        }
+    }
+
+    pub fn did_variables_update( &mut self ) -> bool {
+        let mut result: i8 = 0;
+
+        unsafe {
+            (self.environment_callback)(
+                libretro_sys::ENVIRONMENT_GET_VARIABLE_UPDATE,
+                &mut result as *mut _ as  *mut libc::c_void );
+        }
+
+        result == 1
+    }
+
+    pub fn get_variable( &mut self, key: &str) -> Option<String> {
+        let key = CString::new( key ).unwrap();
+        let data: *mut libc::c_char = ptr::null_mut();
+
+        let mut variable = libretro_sys::Variable {
+            key: key.as_ptr(),
+            value: data,
+        };
+
+        unsafe {
+            (self.environment_callback)(
+                libretro_sys::ENVIRONMENT_GET_VARIABLE,
+                &mut variable as *mut _ as *mut libc::c_void );
+
+            if variable.value == ptr::null_mut() {
+                None
+            } else {
+                Some( CStr::from_ptr( variable.value ).to_str()
+                      .unwrap().to_string() )
+            }
         }
     }
 
